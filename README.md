@@ -1,4 +1,4 @@
-## Blue-Green Deployment on AWS (ECS + ALB)
+# Blue-Green Deployment on AWS (ECS + ALB)
 
 This project demonstrates a blue/green deployment strategy for deploying a web application using AWS ECS (Elastic Container Service). The blue/green deployment approach allows seamless updates with minimal downtime, ensuring a reliable and scalable deployment process. 
 

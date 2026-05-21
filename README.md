@@ -1,622 +1,401 @@
-# Blue-Green Deployment on AWS ECS
+## Blue-Green Deployment on AWS (ECS + ALB)
 
-A step-by-step guide to implementing Blue-Green deployment using Amazon ECS (EC2 launch type),
-Application Load Balancer, ECR, CodeBuild, and S3 — based on a working production setup.
+This project demonstrates a blue/green deployment strategy for deploying a web application using AWS ECS (Elastic Container Service). The blue/green deployment approach allows seamless updates with minimal downtime, ensuring a reliable and scalable deployment process. 
 
-> **Account:** `100303966926` | **Region:** `us-east-1 (N. Virginia)` | **User:** `vaishnavi%20Jagtap`
 
----
+<img width="1991" height="895" alt="image" src="https://github.com/user-attachments/assets/e0dcb301-c96b-473c-a8a7-e8b3365170ee" />
 
-## Architecture Overview
+# Architecture of project:
 
-```
-Internet
-   │
-   ▼
-Application Load Balancer (ecs-ALB)
-   │  DNS: ecs-ALB-489835085.us-east-1.elb.amazonaws.com
-   │  VPC: vpc-0bd984acc6d439752
-   │
-   └──► Target Group (ecs-tg)  [HTTP:80 | Instance type]
-           │  6 Total targets: 4 Healthy | 2 Unhealthy
-           │
-           ├──► ecs-blue-taskdef-service  (2/2 Tasks Running, EC2, Replica)
-           └──► ecs-green-taskdef-service (2/2 Tasks Running, EC2, Replica)
+<img width="1100" height="733" alt="image" src="https://github.com/user-attachments/assets/b4c462fd-2f70-4942-8d89-533193cf7c34" />
 
-ECS Cluster: ecs-cluster
-   ARN: arn:aws:ecs:us-east-1:100303966926:cluster/ecs-cluster
-   Status: Active | CloudWatch: Default | Container instances: 1 EC2
-   Tasks: 4 Running
+## Networking configuration:
+1) VPC
+2) two public subnets
+3) internet gateway
+4) route table
+5) NACL
+6) compute configuration:
+7) security group
 
-Auto Scaling Group: ecs-ASG
-   Desired: 1 | Min: 1 | Max: 2 | Status: At desired capacity
-   Created: Mon May 18 2026 17:06:59 GMT+0530
+## launch template:
 
-   └── Launch Template: ecs-launch-template (lt-0e934afe9f38b681b)
-       AMI: ami-0f1fa1255d3d32671 | Type: t3.micro | Key: practical
-       AZs: us-east-1a, us-east-1b
-       Subnets: subnet-06587e34d9fca778f | subnet-017bbae9a0c9abdff
-       Security Group: sg-0f4ec2d29460195d3
-
-ECR Repository: ca-container-registry (Private)
-   ├── testblue  — 42.00 MB | Created: May 16 2026 11:13:45 | Last pulled: May 18 17:53:39
-   └── testgreen — 42.01 MB | Created: May 16 2026 11:21:32 | Last pulled: May 18 18:40:27
-
-Task Definitions (Active):
-   ├── ecs-blue-taskdef
-   └── ecs-green-taskdef
-
-CodeBuild Projects:
-   ├── ecs-blue-project  (Source: S3 → ecs-blue.zip  | Status: Succeeded | 2 days ago)
-   └── ecs-green-project (Source: S3 → ecs-green.zip | Status: Succeeded | 2 days ago)
-
-S3 Bucket: ecs-bluegreen-project-bucket
-   ├── ecs-blue.zip  — 1.8 KB | May 16 2026 10:53:31 | Standard
-   └── ecs-green.zip — 1.7 KB | May 16 2026 10:53:32 | Standard
-
-IAM Roles (5 project-specific + 7 AWS service-linked):
-   ├── AWSServiceRoleForAutoScaling
-   ├── AWSServiceRoleForECS
-   ├── AWSServiceRoleForElasticLoadBalancing
-   ├── AWSServiceRoleForRDS
-   ├── AWSServiceRoleForResourceExplorer
-   ├── AWSServiceRoleForSupport
-   ├── AWSServiceRoleForTrustedAdvisor
-   ├── codebuild-ecs-blue-project-service-role  (codebuild)
-   ├── ecsExternalInstanceRole                  (ssm)
-   ├── ecsInstanceRole                          (ec2)
-   ├── ecsTaskExecutionRole                     (ecs-tasks)
-   └── lambdaec2fullaccessrole                  (lambda)
-```
-
----
-
-## Prerequisites
-
-- AWS account with appropriate permissions
-- AWS CLI installed and configured
-- Docker installed locally
-- EC2 Key Pair named `practical`
-
----
-
-## Step 1: Set Up IAM Roles
-
-> **Screenshot 12** — IAM Roles console showing all 12 roles (5/12 project-specific highlighted)
-
-Create the following roles before provisioning any other resources.
-
-### ecsTaskExecutionRole
-Allows ECS tasks to pull images from ECR and publish logs to CloudWatch.
-
-**Trusted entity:** `ecs-tasks.amazonaws.com`
-**Last activity:** 15 hours ago
-
-Policies to attach:
-- `AmazonECSTaskExecutionRolePolicy`
-
-### ecsInstanceRole
-Allows EC2 instances to register themselves with the ECS cluster.
-
-**Trusted entity:** `ec2.amazonaws.com`
-**Last activity:** 8 minutes ago
-
-Policies to attach:
-- `AmazonEC2ContainerServiceforEC2Role`
-
-### ecsExternalInstanceRole
-**Trusted entity:** `ssm.amazonaws.com`
-
-Policies to attach:
-- `AmazonSSMManagedInstanceCore`
-
-### codebuild-ecs-blue-project-service-role
-Allows CodeBuild to access ECR, ECS, and S3.
-
-**Trusted entity:** `codebuild.amazonaws.com`
-**Last activity:** 2 days ago
-
-Policies to attach:
-- `AmazonEC2ContainerRegistryFullAccess`
-- `AmazonECS_FullAccess`
-- `AmazonS3ReadOnlyAccess`
-- CloudWatch Logs write access
-
----
-
-## Step 2: Create VPC and Networking
-
-Set up a VPC with two public subnets across different Availability Zones (required for the ALB).
-
-> **Screenshot 10** — ASG Network section confirming both subnets and AZ distribution "Balanced best effort"
-
-```
-VPC ID: vpc-0bd984acc6d439752
-  ├── Subnet: subnet-06587e34d9fca778f  (us-east-1a)
-  └── Subnet: subnet-017bbae9a0c9abdff  (us-east-1b)
-```
-
-Create a **Security Group** `sg-0f4ec2d29460195d3` with:
-- Inbound: HTTP (80) from `0.0.0.0/0`
-- Inbound: SSH (22) from your IP
-- Outbound: All traffic
-
----
-
-## Step 3: Create EC2 Launch Template
-
-> **Screenshot 11** — `ecs-launch-template` (lt-0e934afe9f38b681b) details page in EC2 console
-
-| Setting | Value |
-|---|---|
-| Launch Template ID | `lt-0e934afe9f38b681b` |
-| Launch Template Name | `ecs-launch-template` |
-| Default Version | `1` |
-| AMI ID | `ami-0f1fa1255d3d32671` (Amazon Linux 2 ECS-Optimized) |
-| Instance type | `t3.micro` |
-| Key pair name | `practical` |
-| Security group ID | `sg-0f4ec2d29460195d3` |
-| Availability Zone | `us-east-1a` |
-| Owner | `arn:aws:iam::100303966926:root` |
-| Created | `2026-05-18T11:32:00.000Z` |
-
-Add the following **User Data** so instances auto-register with the ECS cluster on boot:
-
-```bash
-#!/bin/bash
+advanced configuration: add user data
+#!/usr/bin/env bash
 echo ECS_CLUSTER=ecs-cluster >> /etc/ecs/ecs.config
-```
+This user data script tells that,Auto Scaling group has been configured in such a way that it will launch container instances that will join an ECS cluster with this name(ecs-cluster)
 
----
+## Auto scalling group:
 
-## Step 4: Create Auto Scaling Group
+Use the latest ECS-optimized Amazon Linux 2 image for 64-bit x86 for the operating system
+Will attempt to join an Amazon ECS cluster named ecs-cluster
+Have an IAM instance profile attached with an IAM role appropriate for ECS container instances
+Use a pre-configured security group that allows inbound traffic on port 80 and port 8081
+Are tagged with the name ecs-instance
+Application load balencer
 
-> **Screenshot 10** — `ecs-ASG` capacity overview showing Desired:1, Min:1, Max:2, Status: At desired capacity
+## Target group
 
-| Setting | Value |
-|---|---|
-| ASG Name | `ecs-ASG` |
-| ARN | `arn:aws:autoscaling:us-east-1:100303966926:autoScalingGroup:2e96372f-eb5d-4e84-ba26-f9a55a1fd50c:autoScalingGroupName/ecs-ASG` |
-| Launch template | `ecs-launch-template` (Latest version) |
-| Desired capacity | `1` |
-| Min | `1` |
-| Max | `2` |
-| Capacity type | Units (number of instances) |
-| Status | At desired capacity |
-| Availability Zones | `us-east-1a (use1-az1)`, `us-east-1b (use1-az2)` |
-| Subnets | `subnet-06587e34d9fca778f`, `subnet-017bbae9a0c9abdff` |
-| AZ distribution | Balanced best effort |
-| Request Spot Instances | No |
-| Created | Mon May 18 2026 17:06:59 GMT+0530 (India Standard Time) |
+IAM configuration:
+1.CodeBuildServiceRole
 
----
+2.ecsTaskExecutionRole
+Storage configuration:
+Amazon S3 bucket : add object in s3 bucket
 
-## Step 5: Create ECS Cluster
+ecs-blue
 
-> **Screenshot 3** — Clusters list: `ecs-cluster` | 2 Services | 0 Pending | 4 Running | 1 EC2 | CloudWatch: Default
+ecs-green
 
-```bash
-aws ecs create-cluster \
-  --cluster-name ecs-cluster \
-  --region us-east-1
-```
+Note : compress these files to zip and upload in Amazon s3 bucket.
 
-Cluster details after creation:
+## Step 1: Logging In to the Amazon Web Services Console
+login to your AWS account using your credentials.
 
-| Setting | Value |
-|---|---|
-| Cluster name | `ecs-cluster` |
-| ARN | `arn:aws:ecs:us-east-1:100303966926:cluster/ecs-cluster` |
-| Status | Active |
-| CloudWatch monitoring | Default |
-| Registered container instances | 1 EC2 |
-| Active services | 2 |
-| Running tasks | 4 |
-| Pending tasks | - |
-| Draining | - |
-| Capacity provider strategy | No default found |
+Step 2: Creating an Elastic Container Repository
+Amazon Elastic Container Registry (ECR) hosts your images in a highly available and scalable architecture, it also integrates with the Docker CLI and ECS to allow for easy and convenient push, pull, and deployment operations.
 
-Once the ASG launches an EC2, it auto-registers via the User Data script. Confirm **1 EC2** appears under Infrastructure in the cluster console.
+In this step, you will use Amazon ECR to create your own fully-managed Docker container registry within Amazon ECS.
 
----
+In the AWS Management Console search bar, enter ECR, and click the Elastic Container Registry result under Services:
 
-## Step 6: Configure Nginx on EC2 Instance
+Click on the orange Get Started button under Create repository section:
 
-> **Screenshot 1** — SSH session to EC2 at `54.84.88.65` from `C:\Users\vj251` using `practical.pem`
-> Last login: Sun May 17 12:20:26 2026 from 157.32.112.208
+In the Repository configuration section, enter ca-container-registry as the Repository name and then click Create repository:
 
-SSH into the EC2 instance:
+Warning: Ensure that the container repository name matches ca-container-registry exactly. The build code for the application you will deploy expects this repository to exist.
 
-```bash
-ssh -i ./Downloads/practical.pem ec2-user@54.84.88.65
-```
+In this step, you created a repository for Docker images within AWS. This allows you to integrate your Docker images more closely with ECS and other Amazon services, such as CodeBuild.
 
-The instance runs **Amazon Linux 2 (ECS Optimized)**.
+## Step 3: Building Docker Images with AWS CodeBuild
+AWS CodeBuild is a fully-managed build service. CodeBuild can compile code, run tests, and produce packages that you can deploy on any compatible resource. Using CodeBuild in this project eliminates the need for you to create a build server or install any software on your local machine.
 
-> **Note:** AL2 End of Life is 2026-06-30. Consider migrating to Amazon Linux 2023 (supported until 2028-03-15).
-> Docs: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI
+In this step, you will use CodeBuild to build the Docker images containing the two applications you need to complete the project.
 
-Configure Nginx:
+In the search bar at the top, enter CodeBuild, and under Services, click the CodeBuild result:
+The Build projects page of AWS Codebuild will build a project and that project builds a docker image from a zip file(ecs-blue, ecs-green) stored in an Amazon S3 bucket.
 
-```bash
-sudo vi /etc/nginx/conf.d/mysite.conf
-```
+You will create a two project named ecs-blue-project and ecs-green-project that is identical, except that they both uses a different zip file. Both projects will produce Docker images, tagged testblue and testgreen respectively.
 
-Validate and reload:
+Build ecs-bule-project:
+To begin creating the blue CodeBuild project, click Create build project:
 
-```bash
-sudo nginx -t && sudo systemctl reload nginx
-```
+In the Create build project form, configure the following details, leaving the defaults for options not specified:
 
-Expected output (confirmed in screenshot):
-```
-nginx: the configuration file /etc/nginx/nginx.conf syntax is ok
-nginx: configuration file /etc/nginx/nginx.conf test is successful
-```
+Project configuration:
 
-Verify the health endpoint:
-
-```bash
-curl http://localhost/health
-```
-
----
-
-## Step 7: Create ECR Repository and Push Images
-
-> **Screenshot 7** — ECR `ca-container-registry` (Private) showing both images with digest and pull timestamps
-
-```bash
-aws ecr create-repository \
-  --repository-name ca-container-registry \
-  --region us-east-1
-```
-
-Authenticate Docker to ECR and push both images:
-
-```bash
-aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin \
-  100303966926.dkr.ecr.us-east-1.amazonaws.com
-```
-
-**Blue image:**
-```bash
-docker build -t testblue ./blue-app
-docker tag testblue:latest \
-  100303966926.dkr.ecr.us-east-1.amazonaws.com/ca-container-registry:testblue
-docker push \
-  100303966926.dkr.ecr.us-east-1.amazonaws.com/ca-container-registry:testblue
-```
-
-**Green image:**
-```bash
-docker build -t testgreen ./green-app
-docker tag testgreen:latest \
-  100303966926.dkr.ecr.us-east-1.amazonaws.com/ca-container-registry:testgreen
-docker push \
-  100303966926.dkr.ecr.us-east-1.amazonaws.com/ca-container-registry:testgreen
-```
-
-**Resulting images in `ca-container-registry`:**
-
-| Image tag | Type | Size | Created | Last pulled | Digest |
-|---|---|---|---|---|---|
-| `testgreen` | Image | 42.01 MB | May 16 2026, 11:21:32 (UTC+05:5) | May 18 2026, 18:40:27 | `sha256:9a65d8256e802e...` |
-| `testblue`  | Image | 42.00 MB | May 16 2026, 11:13:45 (UTC+05:5) | May 18 2026, 17:53:39 | `sha256:a2bf1a7d3e6f965...` |
-
----
-
-## Step 8: Set Up S3 Bucket for CodeBuild Source
-
-> **Screenshot 6** — S3 bucket `ecs-bluegreen-project-bucket` showing 2 objects
-
-```bash
-aws s3 mb s3://ecs-bluegreen-project-bucket --region us-east-1
-```
-
-Upload application source archives:
-
-```bash
-aws s3 cp ecs-blue.zip  s3://ecs-bluegreen-project-bucket/ecs-blue.zip
-aws s3 cp ecs-green.zip s3://ecs-bluegreen-project-bucket/ecs-green.zip
-```
-
-**Resulting bucket objects:**
-
-| Object | Type | Size | Last Modified | Storage class |
-|---|---|---|---|---|
-| `ecs-blue.zip`  | zip | 1.8 KB | May 16, 2026 10:53:31 UTC+05:30 | Standard |
-| `ecs-green.zip` | zip | 1.7 KB | May 16, 2026 10:53:32 UTC+05:30 | Standard |
-
-Each zip must contain:
-- `Dockerfile`
-- Application source code
-- `buildspec.yml`
-
-### Sample `buildspec.yml` (for blue)
-
-```yaml
-version: 0.2
-
-phases:
-  pre_build:
-    commands:
-      - echo Logging into ECR...
-      - aws ecr get-login-password --region us-east-1 | docker login
-          --username AWS --password-stdin
-          100303966926.dkr.ecr.us-east-1.amazonaws.com
-  build:
-    commands:
-      - echo Building Docker image...
-      - docker build -t ca-container-registry:testblue .
-      - docker tag ca-container-registry:testblue
-          100303966926.dkr.ecr.us-east-1.amazonaws.com/ca-container-registry:testblue
-  post_build:
-    commands:
-      - echo Pushing image to ECR...
-      - docker push
-          100303966926.dkr.ecr.us-east-1.amazonaws.com/ca-container-registry:testblue
-      - echo Updating ECS service...
-      - aws ecs update-service
-          --cluster ecs-cluster
-          --service ecs-blue-taskdef-service
-          --force-new-deployment
-          --region us-east-1
-```
-
----
-
-## Step 9: Create CodeBuild Projects
-
-> **Screenshot 5** — CodeBuild Build projects list: both `ecs-blue-project` and `ecs-green-project` show Succeeded, modified 2 days ago
-
-### ecs-blue-project
-
-| Setting | Value |
-|---|---|
-| Name | `ecs-blue-project` |
-| Source provider | Amazon S3 |
-| Repository (bucket/key) | `ecs-bluegreen-project-bucket/ecs-blue.zip` |
-| Latest build status | Succeeded |
-| Last modified | 2 days ago |
-| Service role | `codebuild-ecs-blue-project-service-role` |
-| Privileged mode | Enabled (required for Docker builds) |
-
-### ecs-green-project
-
-| Setting | Value |
-|---|---|
-| Name | `ecs-green-project` |
-| Source provider | Amazon S3 |
-| Repository (bucket/key) | `ecs-bluegreen-project-bucket/ecs-green.zip` |
-| Latest build status | Succeeded |
-| Last modified | 2 days ago |
-| Service role | `codebuild-ecs-blue-project-service-role` |
-
-Trigger builds:
-
-```bash
-aws codebuild start-build --project-name ecs-blue-project  --region us-east-1
-aws codebuild start-build --project-name ecs-green-project --region us-east-1
-```
-
----
-
-## Step 10: Create ECS Task Definitions
-
-> **Screenshot 4** — Task Definitions showing `ecs-blue-taskdef` and `ecs-green-taskdef`, both Active
-
-### ecs-blue-taskdef
-
-```json
-{
-  "family": "ecs-blue-taskdef",
-  "executionRoleArn": "arn:aws:iam::100303966926:role/ecsTaskExecutionRole",
-  "networkMode": "bridge",
-  "containerDefinitions": [
-    {
-      "name": "blue-container",
-      "image": "100303966926.dkr.ecr.us-east-1.amazonaws.com/ca-container-registry:testblue",
-      "memory": 256,
-      "cpu": 128,
-      "essential": true,
-      "portMappings": [
-        {
-          "containerPort": 80,
-          "hostPort": 0,
-          "protocol": "tcp"
-        }
-      ]
-    }
-  ],
-  "requiresCompatibilities": ["EC2"]
-}
-```
-
-### ecs-green-taskdef
-
-Same structure — replace image tag with `testgreen` and family with `ecs-green-taskdef`.
-
-Register both:
-
-```bash
-aws ecs register-task-definition \
-  --cli-input-json file://ecs-blue-taskdef.json \
-  --region us-east-1
-
-aws ecs register-task-definition \
-  --cli-input-json file://ecs-green-taskdef.json \
-  --region us-east-1
-```
-
-**Result:** Both task definitions appear in the console with status **Active**.
-
----
-
-## Step 11: Create Target Group
-
-> **Screenshot 8** — Target group `ecs-tg` — 6 Total targets: 4 Healthy, 2 Unhealthy | Attached to `ecs-ALB`
-
-| Setting | Value |
-|---|---|
-| Name | `ecs-tg` |
-| ARN | `arn:aws:elasticloadbalancing:us-east-1:100303966926:targetgroup/ecs-tg/94599b0cd1a6f0bd` |
-| Target type | Instance |
-| Protocol : Port | HTTP : 80 |
-| Protocol version | HTTP1 |
-| VPC | `vpc-0bd984acc6d439752` |
-| IP address type | IPv4 |
-| Load balancer | `ecs-ALB` |
-| Total targets | 6 (4 Healthy, 2 Unhealthy, 0 Unused, 0 Initial, 0 Draining) |
-
-Set the health check path to `/health` (served by Nginx on port 80 of each EC2 instance).
-
----
-
-## Step 12: Create Application Load Balancer
-
-> **Screenshot 9** — Load Balancer `ecs-ALB`: Active, Internet-facing, Application, IPv4 | Created May 18 2026 17:16
-
-| Setting | Value |
-|---|---|
-| Name | `ecs-ALB` |
-| ARN | `arn:aws:elasticloadbalancing:us-east-1:100303966926:loadbalancer/app/ecs-ALB/8d62bc23f0f73955` |
-| Load balancer type | Application |
-| Status | Active |
-| Scheme | Internet-facing |
-| IP address type | IPv4 |
-| VPC | `vpc-0bd984acc6d439752` |
-| Availability Zones | 2 Availability Zones |
-| Security group | `sg-0f4ec2d29460195d3` |
-| DNS name | `ecs-ALB-489835085.us-east-1.elb.amazonaws.com` (A Record) |
-| Hosted zone | `Z35SXDOTRQ7X7K` |
-| Date created | May 18, 2026 17:16 UTC+05:30 |
-
-Add an **HTTP:80** listener forwarding to the `ecs-tg` target group.
-
----
-
-## Step 13: Create ECS Services
-
-> **Screenshot 2** — Cluster services tab: both services Active with 2/2 tasks running, Deployment Completed
-> **Screenshot 3** — Cluster overview: 4 Running tasks, 2 Active services, 1 EC2
-
-### ecs-blue-taskdef-service
-
-```bash
-aws ecs create-service \
-  --cluster ecs-cluster \
-  --service-name ecs-blue-taskdef-service \
-  --task-definition ecs-blue-taskdef \
-  --desired-count 2 \
-  --launch-type EC2 \
-  --scheduling-strategy REPLICA \
-  --load-balancers \
-    "targetGroupArn=arn:aws:elasticloadbalancing:us-east-1:100303966926:targetgroup/ecs-tg/94599b0cd1a6f0bd,containerName=blue-container,containerPort=80" \
-  --region us-east-1
-```
-
-### ecs-green-taskdef-service
-
-```bash
-aws ecs create-service \
-  --cluster ecs-cluster \
-  --service-name ecs-green-taskdef-service \
-  --task-definition ecs-green-taskdef \
-  --desired-count 2 \
-  --launch-type EC2 \
-  --scheduling-strategy REPLICA \
-  --load-balancers \
-    "targetGroupArn=arn:aws:elasticloadbalancing:us-east-1:100303966926:targetgroup/ecs-tg/94599b0cd1a6f0bd,containerName=green-container,containerPort=80" \
-  --region us-east-1
-```
-
-**Expected result in console:**
-
-| Service name | Status | Scheduling | Launch | Task definition | Tasks | Last deployment |
-|---|---|---|---|---|---|---|
-| `ecs-blue-taskdef-service`  | Active | Replica | EC2 | `ecs-blue-taskd...`  | 2/2 Running | Completed |
-| `ecs-green-taskdef-service` | Active | Replica | EC2 | `ecs-green-task...` | 2/2 Running | Completed |
-
----
-
-## Step 14: Perform the Blue-Green Switch
-
-To shift all traffic, update the ALB listener to forward to the desired environment.
-
-### Switch to Green (Console)
-
-1. Go to **EC2 → Load Balancers → ecs-ALB → Listeners and rules**
-2. Edit the **HTTP:80** listener
-3. Change **Forward to** target group from blue to green
-4. Save changes
-
-### Switch to Green (CLI)
-
-```bash
-# Get listener ARN
-aws elbv2 describe-listeners \
-  --load-balancer-arn arn:aws:elasticloadbalancing:us-east-1:100303966926:loadbalancer/app/ecs-ALB/8d62bc23f0f73955 \
-  --region us-east-1
-
-# Forward traffic to green
-aws elbv2 modify-listener \
-  --listener-arn <listener-arn> \
-  --default-actions Type=forward,TargetGroupArn=<green-tg-arn> \
-  --region us-east-1
-```
-
-### Rollback to Blue (instant, no redeployment needed)
-
-```bash
-aws elbv2 modify-listener \
-  --listener-arn <listener-arn> \
-  --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:us-east-1:100303966926:targetgroup/ecs-tg/94599b0cd1a6f0bd \
-  --region us-east-1
-```
-
----
-
-## Final State Verification
-
-| Screenshot | Resource | Confirmed State |
-|---|---|---|
-| Screenshot 1 | EC2 SSH + Nginx | Config OK, `/health` responding |
-| Screenshot 2 | ECS Services | Both Active, 2/2 tasks, Deployment Completed |
-| Screenshot 3 | ECS Cluster `ecs-cluster` | Active, 1 EC2, 4 Running tasks |
-| Screenshot 4 | Task Definitions | `ecs-blue-taskdef` + `ecs-green-taskdef` Active |
-| Screenshot 5 | CodeBuild | Both projects Succeeded |
-| Screenshot 6 | S3 Bucket | `ecs-blue.zip` (1.8KB) + `ecs-green.zip` (1.7KB) |
-| Screenshot 7 | ECR | `testblue` (42MB) + `testgreen` (42MB) |
-| Screenshot 8 | Target Group `ecs-tg` | 6 targets: 4 Healthy, 2 Unhealthy |
-| Screenshot 9 | ALB `ecs-ALB` | Active, Internet-facing, DNS assigned |
-| Screenshot 10 | ASG `ecs-ASG` | At desired capacity (1), Min 1 Max 2 |
-| Screenshot 11 | Launch Template | `ecs-launch-template` v1, t3.micro, AL2 ECS AMI |
-| Screenshot 12 | IAM Roles | All 5 project roles present and trusted |
-
----
-
-## Key Concepts
-
-**Blue environment** — The currently live production version serving all user traffic.
-
-**Green environment** — The new version deployed and tested in parallel before any traffic shift.
-
-**Zero-downtime switching** — Traffic is cut over instantly at the ALB listener level. The old environment keeps running alongside for immediate rollback with no redeployment.
-
-**When to use this pattern** — New feature releases, dependency upgrades, or any change where instant rollback is business-critical.
-
----
-
-## Troubleshooting
-
-| Issue | What to Check |
-|---|---|
-| Tasks not starting | EC2 registered in cluster? Check cluster → Infrastructure tab |
-| Unhealthy targets in `ecs-tg` | Nginx `/health` returning 200? Port 80 open in `sg-0f4ec2d29460195d3`? |
-| CodeBuild failing | Privileged mode enabled? `codebuild-ecs-blue-project-service-role` has ECR + ECS permissions? |
-| Images not pulling | `ecsTaskExecutionRole` has `AmazonECSTaskExecutionRolePolicy` attached? |
-| ALB returning 502 | Container port in task definition matches the port the app listens on? |
-| EC2 not joining cluster | `ECS_CLUSTER=ecs-cluster` in `/etc/ecs/ecs.config`? SSH with `ssh -i ./Downloads/practical.pem ec2-user@<ip>` |
-| SSH connection refused | Security group allows port 22? Using the correct `practical` key pair? |
+Project name: Enter ecs-blue-project
+Source:
+
+Source provider: Select Amazon S3
+Bucket: <your_s3_bucket_name>
+S3 object key: Enter ecs-blue.zip
+Environment:
+
+Environment image: Ensure Managed image is selected
+Operating system: Select Ubuntu
+Runtime: Select Standard
+Image: Select aws/codebuild/standard:6.0
+Image version: Select Always use the latest image for this runtime version
+Privileged: Checked
+Service role: Select Existing service role
+Role ARN: Select the CodeBuildServiceRole role
+Allow AWS CodeBuild to modify this service role...: Unchecked
+Buildspec:
+
+Build specifications: Ensure Use a buildspec file is selected
+Buildspec name: Enter buildspec.yml
+Artifacts:
+
+Type: Ensure No artifacts is selected
+Warning: Ensure you have checked the Privileged checkbox before proceeding. If this is unchecked, the docker client will be unable to access the host's docker instance, and building the image will fail.
+
+The project uses Ubuntu Linux with Docker installed as the build environment to create the image. The build spec is a collection of build commands and settings that provide instructions on how to build the Docker image and where to push it once complete.
+
+To create your code build project, click Create build project:
+
+To modify your project's environment, click on Edit > Environment:
+
+Uncheck Allows AWS CodeBuild to modify this service role... if it has been selected:
+
+Expand Additional configuration, scroll down to Environment variables, and enter the following:
+
+Name: AWS_ACCOUNT_ID
+Value: <your_AWS_Account_ID>
+Type: Ensure Plaintext is selected
+The Account ID is used to construct the ECR repository URI during the build process. The AWS region is also required to construct the URI. However, CodeBuild includes an AWS_REGION environment variable in build environment by default.
+
+At the bottom of the page, click Update environment:
+
+To start building the blue project, click Start build:
+
+Build ecs-green-project:
+You will create a second project named ecs-green-project that is identical to the blue project you just created, except that it uses a different zip file(ecs-green)
+
+repeat all the step above except:
+
+project name: ecs-green-project
+
+zip file name:ecs-green.zip
+
+Return to the Build projects page and observe that the Last build status for both blue and green projects reports Succeeded:
+You have built two Docker images, a blue and green version of the same application.
+
+Navigate to the Amazon Elastic Container Registry, and click on the repository named ca-container-registry:
+You will see two images listed, named testgreen and testblue:
+
+The application buildspec.yml files(buildspec.yml) tag the container images with testgreen or testblue, depending on the version of the application they contain.
+
+In this step, you used CodeBuild to create two Docker container images with two different applications.
+
+## Step 4: Creating an Amazon ECS Cluster
+An Amazon Elastic Container Service (ECS) cluster is a logical grouping of container instances where you can define task definitions to execute tasks.
+
+In this lab step, you will create an ECS cluster using a pre-configured Amazon EC2 Auto Scaling group (ASG), and a pre-configured Amazon Virtual Private Cloud (VPC) network.
+
+In the search bar at the top of the AWS Management Console, enter ECS, and under Services, click the Elastic Container Service result:
+
+To navigate to the clusters page, in the left-hand menu, click Clusters:
+
+To begin creating a new ECS cluster, in the top-right, click Create cluster:
+
+To name your cluster, in the Cluster configuration section, in the Cluster name textbox, enter ecs-cluster:
+
+Warning: Ensure that your cluster name matches ecs-cluster (all lowercase) exactly. The pre-configured Amazon EC2 Auto Scaling group has been configured to launch container instances that will join an ECS cluster with this name. If the name does not match, later lab steps will not work correctly.
+
+In the rest of the form, configure the following:
+Infrastructure:
+Deselect AWS Fargate
+Note: Ensure all non-greyed-out options in the Infrastructure section are unchecked, you will add infrastructure to the cluster later in this step.
+
+To finish creating your ECS cluster, at the bottom of the page, click Create:
+The ECS cluster creation process is a fairly complex operation that utilizes the following Amazon services:
+
+Elastic Compute Cloud (EC2): The cluster is powered by EC2 instances and networking features
+Identity and Access Management (IAM): The EC2 instances require roles with defined policies to securely interact with other services
+AWS CloudFormation: CloudFormation is the mechanism that deploys and manages your cluster as configured
+To view details of your cluster, in the clusters list, click ecs-cluster:
+Creating infrastructure for our ecs-cluster:
+To see infrastructure information about this cluster, in the row of tabs under the Cluster overview, click Infrastructure:
+
+To create an Amazon ECS capacity provider for an Amazon EC2 Autoscaling Group, on the right-hand side of the Capacity providers section, click Create:
+
+To configure a capacity provider, enter and select the following:
+
+Basic details: Capacity provider name: Enter ecs-capacity-provider
+
+Auto Scaling group:
+
+Select the existing ASG whose name begins with <Your_ASG_name>
+Scaling policies (Expand this)
+
+Uncheck Turn on managed scaling
+You have specified that the cluster will use Amazon EC2 instances in an existing Auto Scaling group to run containers on.
+
+Auto Scaling group is standard and configured similarly to an ASG that could be used to manage autoscaling for an application running on Amazon EC2 instances without using ECS.
+
+To finish creating the capacity provider, at the bottom of the page, click Create:
+
+Scroll down and observe the Container instances table:
+
+You will see one container instance listed.
+
+This Amazon EC2 instance was launched by the pre-configured Amazon EC2 Auto Scaling group that was created earlier. Now that you have created a cluster named ecs-cluster, the instance has joined your Amazon Elastic Container Service cluster.
+
+In this step, you created a new Amazon ECS cluster, and you configured it to use a pre-existing VPC and ASG.
+
+## Step 5: Creating Amazon ECS Task Definitions
+Task definitions are required to run Docker containers in Amazon ECS. They tell the services which Docker images to use for the container instances, what kind of resources to allocate, network specifics, and other details.
+
+In this step, you will create two task definitions, one for your blue application and one for your green application.
+
+In the Amazon ECS console, in the left-hand menu, click Task definitions:
+
+To begin creating a new task definition, in the top-right, click Create new task definition, and click Create new task definition in the dropdown that appears:
+
+Create ecs-blue task definition:
+To configure your task definition, enter and select the following, leaving all other options at their default:
+Task definition configuration:
+
+Task definition family: Enter ecs-blue-taskdef
+Infrastructure requirements:
+
+Launch type: Deselect AWS Fargate (Serverless), and select Amazon EC2 instances
+Network mode: default
+CPU: Enter 0.125 vCPU
+Memory: Enter 0.25 GB
+Task role: ecsTaskExecutionRole
+Task execution role: ecsTaskExecutionRole
+Container - 1:
+
+Name: Enter ecs-blue-container
+Image URI: Enter the URI of the testblue Docker image URI you made a note of previously
+Container port: Change to 8081
+Logging:
+
+Uncheck Use log collection
+8081 is the port that the blue and green applications listen on when they are run.
+
+Amazon ECS supports creating task definitions comprised of multiple containers. You have specified CPU and memory limits at the task level. You can also do so for each container in the task definition. In this lab, as there is only one container in the definition, you do not need to specify container-level limits.
+
+To finish creating the task definition for the blue container, scroll to the bottom and click Create:
+
+Return to the task definitions page by clicking Task definitions in the breadcrumb navigation at the top of the page:
+
+Repeat the instructions for creating a task definition, with the following changes:
+
+Create ecs-green task definition:
+Enter ecs-green-taskdef for the Task definition family
+Enter ecs-green-container for the container name
+Use the URI of the testgreen image from your Amazon ECR repository for the Image URI
+For all other options, configure the same values as you did for the blue container.
+In this step, you created two task definitions for your application. You specified information about the Docker container images, resources, and networking details to use.
+
+## Step 6: Creating Amazon ECS Services
+An ECS service is a mechanism that allows ECS to run and maintain a specified number of instances of a task definition. If any tasks or container instances should fail or stop, the ECS service scheduler launches another instance to replace it. This is similar to Auto Scaling in that it maintains a desired number of instances, but it does not scale instances up or down based on CloudWatch alarms or other Auto Scaling mechanisms. Services behind a load balancer provide a relatively seamless way to maintain a certain amount of resources while keeping a single application reference point.
+
+In this step, you will create two services, one for your blue application and one for the green application.
+
+In the Amazon ECS console, in the left-hand menu, click Clusters, and in the table, click ecs-cluster:
+
+To begin creating a new Amazon ECS service, in the Services tab at the bottom of the page, click Create:
+
+create a service for Blue app:
+Enter and select the following to configure a service for your blue application:
+Environment:
+Compute Options: Launch type
+Launch Type: EC2
+Deployment configuration:
+Application type: Ensure Service is selected
+Family: Select ecs-blue-taskdef
+Revision: Ensure the selected Revision is LATEST
+Service name: Enter ecs-blue-service
+Desired tasks: Replace 1 with 2
+Scroll down and click on Load balancing to expand the load balancing section:
+An application load balancer and appropriate related resources we have been pre-configured for this project.
+
+Enter and select the following to configure a public-facing load balancer for your Amazon ECS service:
+Load balancer type: Select Application Load Balancer
+Application Load Balancer: Select Use an existing load balancer
+Load balancer: Select <Your_ALB_name>
+Listener: Select Use an existing listener
+Listener: Select 80:HTTP
+Target group: Select Use an existing target group
+Target group name: Select <Your_target_group_name>
+Accept the defaults for all other options on this page.
+
+When ready, at the bottom of the page, click Create to finish creating your blue Amazon ECS service:
+
+To view the tasks in your service, in the row of tabs, click Tasks:
+
+create a service for Green app:
+Repeat the instructions for creating a service, with the following changes:
+Deployment configuration:
+
+Family: Select ecs-green-taskdef
+Service name: Enter ecs-green-service
+Desired tasks: Replace 1 with 0
+For all other options, configure the same values as you did for the blue service
+
+Configure the Load balancing options to be the same as those for the blue service.
+
+Notice that you have set Desired tasks to zero. A service with zero tasks will not launch any container instances upon creation. This allows you to prepare for future operations before your deployment is fully ready.
+
+Notice that the blue service has two running tasks and the green service has zero.
+
+In this step, you created two services for your blue and green applications. You learned how these services control the desired capacity. You started two tasks for the blue application upon service creation. These tasks launched and registered two container instances.
+
+## Step 7: Viewing Instances and the Application's Message
+Now that you have put all of the pieces in place to build and store Docker images, dynamically register container instances, and maintain a target capacity, it is time to learn more about the interdependent service actions and see some results.
+
+In this step, you will view the resources launched by Amazon ECS and access the blue application launched when you created the blue service.
+
+observe the Host EC2 instance:
+In the search bar at the top of the AWS Management Console, enter EC2, and under Services, click the EC2 result:
+
+To view Amazon EC2 instances, in the left-hand menu, under Instances, click Instances:
+
+You will see one running instance named ecs-instance: This instance was launched by the Amazon EC2 Auto Scaling group that we configured before as part of the setup of this project.
+
+observe the container instances deployed by the ECS service:
+To list load-balancing target groups, in the left-hand menu, under Load Balancing, click Target Groups:
+You will see one target group listed named <Your_target_group_name>.
+
+To see details of the target group, under Name, click <Your_target_group_name> :
+Observe the Registered targets table on the Targets tab:
+
+Notice that you have two healthy targets despite having only one running EC2 instance. ECS deployed two container instances on the EC2 host instance. Each container instance is dynamically registered with the target group on an assigned port in the ephemeral port range.
+
+Test the Blue application:
+To navigate to load balancers, in the left-hand menu, under Load Balancing, click Load Balancers:
+
+To view details of the load balancer, under Name, click <Your_ALB_name>:
+
+Under DNS name, click the copy icon to copy the DNS name of the load balancer to your clipboard:
+
+In a new browser tab, paste the DNS name, append /api/ to the end of it, and press enter:
+
+In response, your browser will display:
+
+{"message": "Hello - I'm BLUE"}
+The format or appearance may vary slightly depending on the browser you use. This is a simple JavaScript Object Notation (JSON) message delivered by the application running on the container instances.
+
+In this step, you looked at the resources created by your ECS services and tasks. You also looked at the end result of your application, a JSON message accessible through HTTP.
+
+## Step 8: Updating the Services and Application Deployments
+Now that you know how the services interact and how to launch tasks into your Amazon ECS cluster, it is time to switch from one application to the next. A blue-green deployment is a technique that uses two identical production environments to reduce downtime.
+
+In this step, you will launch both applications with all of the container instances you need, including a brief overlap period, to demonstrate the load balancer's round-robin distribution and container resource efficiency.
+
+Update the desired task of green app:
+Navigate to the Clusters page of the Amazon ECS console.
+
+To access the cluster overview, click ecs-cluster:
+
+To select the green service, in the Services tab, click the checkbox next to ecs-green-service:
+
+To modify the green service, with it selected, click Update:
+
+Change Desired tasks from 0 to 2:
+
+To make this change take effect, at the bottom of the page, click Update:
+
+Return to the Target Groups section of the Amazon EC2 console and click <Your_target_group_nmme> to view details.
+
+You will now see four instances under Registered targets:
+
+The reduced resource requirements for a Docker container allow you to run multiple container instances on one EC2 instance. This works well for applications that require little resources, such as this simple message application.
+
+Test the green application:
+Refresh your browser tab with the DNS name of the load balancer in the address bar.
+It may take several refreshes, but you will see the message change:
+
+{"message": "Hello - I'm GREEN"}
+Right now you have both versions of the application running in their own pair of container instances.
+
+Return to the cluster overview page for your cluster in the Amazon ECS console.
+Update the desired task of blue app:
+Select the ecs-blue-service and click Update:
+
+Reduce the Desired tasks field from 2 to 0, and click Update at the bottom of the page:
+
+Optional: Feel free to return to the target group page of the Amazon EC2 console and observe two of the registered targets being deregistered.
+
+Refresh your browser tab with the DNS name of the load balancer in the address bar several times.
+This time you will only see the message from the green application. It may take a couple of refreshes to see the change take effect.
+
+By swapping the desired tasks of each service, you have manually replicated a blue/green deployment.
+
+## Services used:
+All of the services used in this project (most prominently ECS, EC2, CodeBuild, and ECR) are well supported by the AWS command-line interface (CLI), AWS HTTP application programming interface (API), and AWS software development kits (SDK). Using these methods to create, configure, and operate the Amazon ECS and related services can result in fully automated deployments that are customized to your needs and workflow.
+
+## Summary
+In this project, you used AWS CodeBuild along with Amazon Elastic Container Registry to build and store docker images. You then created a new Amazon Elastic Container Service cluster, and the ECS task definitions and ECS services necessary to perform a blue/green deployment. Finally, you verified that the deployments were working, and manually switched from blue to green versions of the application.
+
+ Medium : https://medium.com/@vj251959/zero-downtime-blue-green-deployment-using-amazon-ecs-24108e1bf023
+
+👨‍💻 Author
+Project Name: Blue-Green Deployment System
+Platform: AWS Cloud
+Purpose: DevOps Learning / Academic Project
+

@@ -392,10 +392,7 @@ All of the services used in this project (most prominently ECS, EC2, CodeBuild, 
 ## Summary
 In this project, you used AWS CodeBuild along with Amazon Elastic Container Registry to build and store docker images. You then created a new Amazon Elastic Container Service cluster, and the ECS task definitions and ECS services necessary to perform a blue/green deployment. Finally, you verified that the deployments were working, and manually switched from blue to green versions of the application.
 
- Medium : https://medium.com/@vj251959/zero-downtime-blue-green-deployment-using-amazon-ecs-24108e1bf023
+ Medium Blog : https://medium.com/@vj251959/zero-downtime-blue-green-deployment-using-amazon-ecs-24108e1bf023
 
-👨‍💻 Author
-Project Name: Blue-Green Deployment System
-Platform: AWS Cloud
-Purpose: DevOps Learning / Academic Project
+
 
